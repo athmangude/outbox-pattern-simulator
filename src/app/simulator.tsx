@@ -204,8 +204,44 @@ export default function Simulator() {
             ));
             addLog("relay", `Pharmacy unavailable — retry ${newRetryCount}/${event.maxRetries} in ${backoffSeconds}s (backoff)`, "warn");
           }
+        } else if (networkBlipRef.current > 0) {
+          // Network blip: pharmacy receives and processes, but ACK is lost
+          const alreadyProcessed = processedRef.current.some(p => p.eventId === event.id);
+
+          if (!alreadyProcessed) {
+            setProcessedEvents(prev => [{ eventId: event.id, processedAt: Date.now(), duplicate: false }, ...prev]);
+            setStats(prev => ({ ...prev, delivered: prev.delivered + 1 }));
+            addLog("pharmacy", `Event ${event.id.slice(0, 12)}... received`, "info");
+            addLog("pharmacy", `Idempotency check: SELECT FROM processed_events WHERE event_id = '${event.id.slice(0, 12)}...' — NOT FOUND`, "info");
+            addLog("pharmacy", `Dispensing ${event.medication} for ${event.patientName} (${event.aggregateId})`, "success");
+            addLog("pharmacy", `INSERT processed_events (${event.id.slice(0, 12)}...)`, "success");
+            addLog("pharmacy", `HTTP 200 OK sent to relay...`, "success");
+          } else {
+            addLog("pharmacy", `SELECT FROM processed_events WHERE event_id = '${event.id.slice(0, 12)}...' — FOUND`, "warn");
+            addLog("pharmacy", `DUPLICATE BLOCKED: ${event.id.slice(0, 12)}... already dispensed`, "warn");
+            addLog("pharmacy", `HTTP 200 OK (duplicate acknowledged) sent to relay...`, "success");
+            setStats(prev => ({ ...prev, duplicatesBlocked: prev.duplicatesBlocked + 1 }));
+          }
+
+          // Either way, the relay never receives the ACK
+          const newRetryCount = event.retryCount + 1;
+          addLog("relay", `NETWORK BLIP: TCP connection reset — HTTP response from pharmacy was lost in transit`, "error");
+
+          if (newRetryCount >= event.maxRetries) {
+            setOutbox(prev => prev.map(e =>
+              e.id === event.id ? { ...e, status: "dlq" as EventStatus, retryCount: newRetryCount } : e
+            ));
+            setDlq(prev => [{ ...event, status: "dlq", retryCount: newRetryCount }, ...prev]);
+            setStats(prev => ({ ...prev, failed: prev.failed + 1 }));
+            addLog("relay", `Max retries (${event.maxRetries}) exhausted for ${event.id.slice(0, 12)}... — moved to DLQ`, "error");
+          } else {
+            setOutbox(prev => prev.map(e =>
+              e.id === event.id ? { ...e, status: "pending" as EventStatus, retryCount: newRetryCount } : e
+            ));
+            addLog("relay", `Relay has no confirmation that ${event.id.slice(0, 12)}... was processed — will retry (${newRetryCount}/${event.maxRetries})`, "warn");
+          }
         } else {
-          // Check idempotency
+          // Normal path: check idempotency then deliver
           const alreadyProcessed = processedRef.current.some(p => p.eventId === event.id);
 
           if (alreadyProcessed) {
@@ -216,26 +252,6 @@ export default function Simulator() {
             addLog("pharmacy", `SELECT FROM processed_events WHERE event_id = '${event.id.slice(0, 12)}...' — FOUND`, "warn");
             addLog("pharmacy", `DUPLICATE BLOCKED: ${event.id.slice(0, 12)}... already dispensed — idempotency key prevented double-dispense`, "warn");
             addLog("relay", `HTTP 200 OK (duplicate acknowledged) — marking ${event.id.slice(0, 12)}... as delivered`, "success");
-          } else if (networkBlipRef.current > 0) {
-            // Network blip: pharmacy processes the event but ACK is lost
-            setProcessedEvents(prev => [{ eventId: event.id, processedAt: Date.now(), duplicate: false }, ...prev]);
-            setStats(prev => ({ ...prev, delivered: prev.delivered + 1 }));
-            addLog("pharmacy", `Event ${event.id.slice(0, 12)}... received`, "info");
-            addLog("pharmacy", `Idempotency check: SELECT FROM processed_events WHERE event_id = '${event.id.slice(0, 12)}...' — NOT FOUND`, "info");
-            addLog("pharmacy", `Dispensing ${event.medication} for ${event.patientName} (${event.aggregateId})`, "success");
-            addLog("pharmacy", `INSERT processed_events (${event.id.slice(0, 12)}...)`, "success");
-            addLog("pharmacy", `HTTP 200 OK sent to relay...`, "success");
-
-            // But the relay never receives the ACK
-            addLog("relay", `NETWORK BLIP: TCP connection reset — HTTP response from pharmacy was lost in transit`, "error");
-            addLog("relay", `Relay has no confirmation that ${event.id.slice(0, 12)}... was processed — will retry delivery`, "warn");
-
-            const newRetryCount = event.retryCount + 1;
-            setOutbox(prev => prev.map(e =>
-              e.id === event.id ? { ...e, status: "pending" as EventStatus, retryCount: newRetryCount } : e
-            ));
-
-            setNetworkBlipRemaining(0);
           } else {
             setOutbox(prev => prev.map(e =>
               e.id === event.id ? { ...e, status: "delivered" as EventStatus, publishedAt: Date.now() } : e
@@ -487,8 +503,8 @@ export default function Simulator() {
                 <button
                   onClick={() => {
                     if (networkBlipRemaining <= 0) {
-                      setNetworkBlipRemaining(3000);
-                      addLog("system", "Network blip ARMED (3.0s) — next delivery will reach the pharmacy but the HTTP acknowledgment will be lost", "warn");
+                      setNetworkBlipRemaining(10000);
+                      addLog("system", "Network blip ARMED (10s) — next delivery will reach the pharmacy but the HTTP acknowledgment will be lost", "warn");
                     } else {
                       setNetworkBlipRemaining(prev => prev + prev);
                       addLog("system", `Network blip EXTENDED — time doubled`, "warn");
@@ -515,7 +531,7 @@ export default function Simulator() {
                 <div className="text-xs text-slate-500 mt-1 px-1">
                   {networkBlipRemaining > 0
                     ? "Click to extend · Double-click to disarm"
-                    : "Click to arm (3s) · Double-click to disarm"
+                    : "Click to arm (10s) · Double-click to disarm"
                   }
                 </div>
               </div>
