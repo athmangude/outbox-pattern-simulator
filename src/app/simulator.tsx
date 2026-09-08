@@ -67,8 +67,9 @@ export default function Simulator() {
   const [pharmacyOnline, setPharmacyOnline] = useState(true);
   const [internetConnected, setInternetConnected] = useState(true);
   const [relayActive, setRelayActive] = useState(true);
-  const [networkBlipArmed, setNetworkBlipArmed] = useState(false);
+  const [networkBlipRemaining, setNetworkBlipRemaining] = useState(0);
   const [speed, setSpeed] = useState(1);
+  const [autoRetry, setAutoRetry] = useState(false);
   const [stats, setStats] = useState({
     created: 0,
     delivered: 0,
@@ -84,7 +85,7 @@ export default function Simulator() {
   const relayActiveRef = useRef(relayActive);
   const speedRef = useRef(speed);
   const processedRef = useRef(processedEvents);
-  const networkBlipRef = useRef(networkBlipArmed);
+  const networkBlipRef = useRef(networkBlipRemaining);
 
   useEffect(() => { outboxRef.current = outbox; }, [outbox]);
   useEffect(() => { pharmacyOnlineRef.current = pharmacyOnline; }, [pharmacyOnline]);
@@ -92,7 +93,19 @@ export default function Simulator() {
   useEffect(() => { relayActiveRef.current = relayActive; }, [relayActive]);
   useEffect(() => { speedRef.current = speed; }, [speed]);
   useEffect(() => { processedRef.current = processedEvents; }, [processedEvents]);
-  useEffect(() => { networkBlipRef.current = networkBlipArmed; }, [networkBlipArmed]);
+  useEffect(() => { networkBlipRef.current = networkBlipRemaining; }, [networkBlipRemaining]);
+
+  // Network blip countdown timer
+  useEffect(() => {
+    if (networkBlipRemaining <= 0) return;
+    const tick = setInterval(() => {
+      setNetworkBlipRemaining(prev => {
+        if (prev <= 100) return 0;
+        return prev - 100;
+      });
+    }, 100);
+    return () => clearInterval(tick);
+  }, [networkBlipRemaining > 0]);
 
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -104,6 +117,27 @@ export default function Simulator() {
       return next.slice(-100);
     });
   }, []);
+
+  // Auto-retry: when pharmacy comes back online, flush DLQ one at a time
+  useEffect(() => {
+    if (!autoRetry || !pharmacyOnline || !internetConnected) return;
+    if (dlq.length === 0) return;
+
+    const timer = setInterval(() => {
+      setDlq(prev => {
+        if (prev.length === 0) return prev;
+        const event = prev[0];
+        setOutbox(o => o.map(e =>
+          e.id === event.id ? { ...e, status: "pending" as EventStatus, retryCount: 0 } : e
+        ));
+        setStats(s => ({ ...s, dlqCount: s.dlqCount - 1 }));
+        addLog("system", `Auto-retry: DLQ event ${event.id.slice(0, 12)}... requeued`, "info");
+        return prev.slice(1);
+      });
+    }, 1500 / speed);
+
+    return () => clearInterval(timer);
+  }, [autoRetry, pharmacyOnline, internetConnected, dlq.length, speed, addLog]);
 
   const createPrescription = useCallback(() => {
     const patientName = PATIENT_NAMES[Math.floor(Math.random() * PATIENT_NAMES.length)];
@@ -184,7 +218,7 @@ export default function Simulator() {
             addLog("pharmacy", `SELECT FROM processed_events WHERE event_id = '${event.id.slice(0, 12)}...' — FOUND`, "warn");
             addLog("pharmacy", `DUPLICATE BLOCKED: ${event.id.slice(0, 12)}... already dispensed — idempotency key prevented double-dispense`, "warn");
             addLog("relay", `HTTP 200 OK (duplicate acknowledged) — marking ${event.id.slice(0, 12)}... as delivered`, "success");
-          } else if (networkBlipRef.current) {
+          } else if (networkBlipRef.current > 0) {
             // Network blip: pharmacy processes the event but ACK is lost
             setProcessedEvents(prev => [{ eventId: event.id, processedAt: Date.now(), duplicate: false }, ...prev]);
             setStats(prev => ({ ...prev, delivered: prev.delivered + 1 }));
@@ -203,8 +237,7 @@ export default function Simulator() {
               e.id === event.id ? { ...e, status: "pending" as EventStatus, retryCount: newRetryCount } : e
             ));
 
-            // Auto-disarm after one use
-            setNetworkBlipArmed(false);
+            setNetworkBlipRemaining(0);
           } else {
             setOutbox(prev => prev.map(e =>
               e.id === event.id ? { ...e, status: "delivered" as EventStatus, publishedAt: Date.now() } : e
@@ -245,6 +278,18 @@ export default function Simulator() {
     ));
     setStats(prev => ({ ...prev, dlqCount: prev.dlqCount - 1 }));
     addLog("system", `DLQ event ${event.id.slice(0, 12)}... requeued for delivery`, "info");
+  };
+
+  const retryAllDlq = () => {
+    if (dlq.length === 0) return;
+    const count = dlq.length;
+    const ids = dlq.map(e => e.id);
+    setOutbox(prev => prev.map(e =>
+      ids.includes(e.id) ? { ...e, status: "pending" as EventStatus, retryCount: 0 } : e
+    ));
+    setDlq([]);
+    setStats(prev => ({ ...prev, dlqCount: 0 }));
+    addLog("system", `All ${count} DLQ events requeued for delivery`, "info");
   };
 
   const sourceColors: Record<LogEntry["source"], string> = {
@@ -293,6 +338,22 @@ export default function Simulator() {
               className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-colors cursor-pointer"
             >
               + Create Prescription
+            </button>
+            <button
+              onClick={() => {
+                const next = !autoRetry;
+                setAutoRetry(next);
+                addLog("system", next ? "DLQ mode: AUTO RETRY — failed events will be requeued automatically when systems recover" : "DLQ mode: MANUAL — failed events require manual intervention to retry", next ? "success" : "info");
+              }}
+              className={`flex items-center gap-2 bg-slate-800 rounded-lg px-3 py-1.5 cursor-pointer transition-colors ${autoRetry ? "ring-1 ring-emerald-700" : ""}`}
+            >
+              <span className="text-xs text-slate-400">DLQ:</span>
+              <span className={`text-xs font-medium ${autoRetry ? "text-emerald-400" : "text-slate-300"}`}>
+                {autoRetry ? "Auto" : "Manual"}
+              </span>
+              <div className={`w-7 h-4 rounded-full relative transition-colors ${autoRetry ? "bg-emerald-700" : "bg-slate-600"}`}>
+                <div className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${autoRetry ? "left-3.5" : "left-0.5"}`} />
+              </div>
             </button>
             <div className="flex items-center gap-2 bg-slate-800 rounded-lg px-3 py-1.5">
               <span className="text-xs text-slate-400">Speed:</span>
@@ -416,21 +477,42 @@ export default function Simulator() {
                 <span>Relay</span>
                 <span className="text-xs font-mono">{internetConnected ? "CONNECTED" : "DISCONNECTED"}</span>
               </button>
-              <button
-                onClick={() => {
-                  setNetworkBlipArmed(true);
-                  addLog("system", "Network blip ARMED — next delivery will reach the pharmacy but the HTTP acknowledgment will be lost, causing a duplicate retry", "warn");
-                }}
-                disabled={networkBlipArmed}
-                className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer border ${
-                  networkBlipArmed
-                    ? "bg-orange-950/50 border-orange-700 text-orange-300 animate-pulse"
-                    : "bg-slate-800/50 border-slate-600 text-slate-300 hover:bg-orange-950/30 hover:border-orange-800 hover:text-orange-300"
-                }`}
-              >
-                <span>Network Blip</span>
-                <span className="text-xs font-mono">{networkBlipArmed ? "ARMED" : "READY"}</span>
-              </button>
+              <div>
+                <button
+                  onClick={() => {
+                    if (networkBlipRemaining <= 0) {
+                      setNetworkBlipRemaining(3000);
+                      addLog("system", "Network blip ARMED (3.0s) — next delivery will reach the pharmacy but the HTTP acknowledgment will be lost", "warn");
+                    } else {
+                      setNetworkBlipRemaining(prev => prev + prev);
+                      addLog("system", `Network blip EXTENDED — time doubled`, "warn");
+                    }
+                  }}
+                  onDoubleClick={(e) => {
+                    e.preventDefault();
+                    if (networkBlipRemaining > 0) {
+                      setNetworkBlipRemaining(0);
+                      addLog("system", "Network blip DISARMED", "info");
+                    }
+                  }}
+                  className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer border ${
+                    networkBlipRemaining > 0
+                      ? "bg-orange-950/50 border-orange-700 text-orange-300"
+                      : "bg-slate-800/50 border-slate-600 text-slate-300 hover:bg-orange-950/30 hover:border-orange-800 hover:text-orange-300"
+                  }`}
+                >
+                  <span>Network Blip</span>
+                  <span className="text-xs font-mono">
+                    {networkBlipRemaining > 0 ? `${(networkBlipRemaining / 1000).toFixed(1)}s` : "READY"}
+                  </span>
+                </button>
+                <div className="text-xs text-slate-500 mt-1 px-1">
+                  {networkBlipRemaining > 0
+                    ? "Click to extend · Double-click to disarm"
+                    : "Click to arm (3s) · Double-click to disarm"
+                  }
+                </div>
+              </div>
             </div>
 
             {/* DLQ */}
@@ -438,12 +520,20 @@ export default function Simulator() {
               <div className="bg-red-950/30 rounded-lg p-3 border border-red-900/50">
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-xs font-mono text-red-400">integration_dlq</span>
-                  <button
-                    onClick={retryDlq}
-                    className="text-xs px-2 py-0.5 rounded bg-red-900/50 text-red-300 hover:bg-red-800/50 cursor-pointer"
-                  >
-                    Retry oldest
-                  </button>
+                  <div className="flex gap-1.5">
+                    <button
+                      onClick={retryDlq}
+                      className="text-xs px-2 py-0.5 rounded bg-red-900/50 text-red-300 hover:bg-red-800/50 cursor-pointer"
+                    >
+                      Retry oldest
+                    </button>
+                    <button
+                      onClick={retryAllDlq}
+                      className="text-xs px-2 py-0.5 rounded bg-red-900/50 text-red-300 hover:bg-red-800/50 cursor-pointer"
+                    >
+                      Retry all
+                    </button>
+                  </div>
                 </div>
                 <div className="space-y-1">
                   {dlq.slice(0, 5).map(event => (
@@ -531,12 +621,6 @@ export default function Simulator() {
         </div>
       </div>
 
-      {/* Footer */}
-      <div className="max-w-7xl mx-auto mt-6 text-center">
-        <p className="text-xs text-slate-600">
-          Athman Gude &mdash; HealthX CTO Consultancy &mdash; September 2026
-        </p>
-      </div>
     </div>
   );
 }
