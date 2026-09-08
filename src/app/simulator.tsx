@@ -74,7 +74,6 @@ export default function Simulator() {
     created: 0,
     delivered: 0,
     failed: 0,
-    dlqCount: 0,
     duplicatesBlocked: 0,
   });
 
@@ -130,7 +129,6 @@ export default function Simulator() {
         setOutbox(o => o.map(e =>
           e.id === event.id ? { ...e, status: "pending" as EventStatus, retryCount: 0 } : e
         ));
-        setStats(s => ({ ...s, dlqCount: s.dlqCount - 1 }));
         addLog("system", `Auto-retry: DLQ event ${event.id.slice(0, 12)}... requeued`, "info");
         return prev.slice(1);
       });
@@ -198,7 +196,7 @@ export default function Simulator() {
               e.id === event.id ? { ...e, status: "dlq" as EventStatus, retryCount: newRetryCount } : e
             ));
             setDlq(prev => [{ ...event, status: "dlq", retryCount: newRetryCount }, ...prev]);
-            setStats(prev => ({ ...prev, failed: prev.failed + 1, dlqCount: prev.dlqCount + 1 }));
+            setStats(prev => ({ ...prev, failed: prev.failed + 1 }));
             addLog("relay", `Max retries (${event.maxRetries}) exhausted for ${event.id.slice(0, 12)}... — moved to DLQ`, "error");
           } else {
             setOutbox(prev => prev.map(e =>
@@ -276,7 +274,6 @@ export default function Simulator() {
     setOutbox(prev => prev.map(e =>
       e.id === event.id ? { ...e, status: "pending" as EventStatus, retryCount: 0 } : e
     ));
-    setStats(prev => ({ ...prev, dlqCount: prev.dlqCount - 1 }));
     addLog("system", `DLQ event ${event.id.slice(0, 12)}... requeued for delivery`, "info");
   };
 
@@ -288,7 +285,6 @@ export default function Simulator() {
       ids.includes(e.id) ? { ...e, status: "pending" as EventStatus, retryCount: 0 } : e
     ));
     setDlq([]);
-    setStats(prev => ({ ...prev, dlqCount: 0 }));
     addLog("system", `All ${count} DLQ events requeued for delivery`, "info");
   };
 
@@ -390,7 +386,7 @@ export default function Simulator() {
           </div>
           <div className="bg-slate-800/50 rounded-lg px-4 py-3 border border-slate-700/50">
             <div className="text-xs text-slate-400">Dead Letter Queue</div>
-            <div className="text-xl font-bold text-red-400 font-mono">{stats.dlqCount}</div>
+            <div className="text-xl font-bold text-red-400 font-mono">{dlq.length}</div>
           </div>
           <div className="bg-slate-800/50 rounded-lg px-4 py-3 border border-slate-700/50">
             <div className="text-xs text-slate-400">Duplicates Blocked</div>
@@ -436,6 +432,16 @@ export default function Simulator() {
                   ))
                 )}
               </div>
+            </div>
+            <div className={`mt-2 rounded-lg p-2.5 border flex items-center justify-between ${
+              dlq.length > 0
+                ? "bg-red-950/30 border-red-900/50"
+                : "bg-slate-900/40 border-slate-700/30"
+            }`}>
+              <div className="flex items-center gap-2">
+                <span className={`text-xs font-mono ${dlq.length > 0 ? "text-red-400" : "text-slate-500"}`}>integration_dlq</span>
+              </div>
+              <span className={`text-sm font-bold font-mono ${dlq.length > 0 ? "text-red-400" : "text-slate-600"}`}>{dlq.length}</span>
             </div>
           </div>
 
